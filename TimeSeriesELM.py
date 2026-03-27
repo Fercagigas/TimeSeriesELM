@@ -1,15 +1,16 @@
-import numpy as np
-from sklearn.base import BaseEstimator, RegressorMixin
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
-from sklearn.linear_model import Ridge
-from typing import Union, Optional, Dict, Any, Tuple
-import logging
 import json
-from dataclasses import dataclass, asdict
-from pathlib import Path
+import logging
+from dataclasses import asdict, dataclass
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple, Union
+
+import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator, RegressorMixin
+from sklearn.linear_model import Ridge
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
 # Configuración de logging
 logging.basicConfig(
@@ -74,7 +75,8 @@ class TimeSeriesELM(BaseEstimator, RegressorMixin):
         lookback: int = 10,
         scale_data: bool = True,
         scaler: Optional[str] = 'standard',
-        random_state: Optional[int] = None
+        random_state: Optional[int] = None,
+        ridge_alpha: float = 1e-3
     ):
         try:
             self.state = ModelState(
@@ -86,9 +88,10 @@ class TimeSeriesELM(BaseEstimator, RegressorMixin):
                 random_state=random_state
             )
             
-            # Establecer la semilla aleatoria si se proporciona
-            if random_state is not None:
-                np.random.seed(random_state)
+            if ridge_alpha <= 0:
+                raise ValueError("ridge_alpha must be positive")
+            self.ridge_alpha = ridge_alpha
+            self._rng = np.random.default_rng(random_state)
             
             self._initialize_attributes()
             logger.info(f"Initialized TimeSeriesELM with config: {self._get_config()}")
@@ -110,6 +113,7 @@ class TimeSeriesELM(BaseEstimator, RegressorMixin):
         self.output_weights_ = None
         self.biases_ = None
         self.input_shape_ = None
+        self.n_features_in_ = None
         self.scaler = self._get_scaler(self.state.scaler) if self.scale_data else None
         
         # Almacenamiento de métricas
@@ -141,6 +145,10 @@ class TimeSeriesELM(BaseEstimator, RegressorMixin):
                 X = X.values
             if isinstance(y, (pd.DataFrame, pd.Series)):
                 y = y.values
+
+            X = np.asarray(X, dtype=float)
+            if y is not None:
+                y = np.asarray(y, dtype=float)
                 
             # Validar dimensiones
             if X.ndim == 1:
@@ -153,9 +161,9 @@ class TimeSeriesELM(BaseEstimator, RegressorMixin):
                     raise ValueError(f"X and y must have the same length. Got X: {len(X)}, y: {len(y)}")
             
             # Verificar valores NaN
-            if np.isnan(X).any():
+            if np.isnan(X).any() or np.isinf(X).any():
                 raise ValueError("Input X contains NaN values")
-            if y is not None and np.isnan(y).any():
+            if y is not None and (np.isnan(y).any() or np.isinf(y).any()):
                 raise ValueError("Input y contains NaN values")
                 
             return X, y
@@ -168,6 +176,7 @@ class TimeSeriesELM(BaseEstimator, RegressorMixin):
         """Aplica la función de activación con manejo de errores."""
         try:
             if self.activation == 'sigmoid':
+                X = np.clip(X, -500, 500)
                 return 1.0 / (1.0 + np.exp(-X))
             elif self.activation == 'tanh':
                 return np.tanh(X)
@@ -206,20 +215,21 @@ class TimeSeriesELM(BaseEstimator, RegressorMixin):
             # Validar entradas
             X, y = self._validate_input(X, y)
             self.input_shape_ = X.shape
+            self.n_features_in_ = X.shape[1]
             
             # Escalar si es necesario
             if self.scaler is not None:
                 X = self.scaler.fit_transform(X)
             
             # Inicializar pesos y biases
-            self.input_weights_ = np.random.normal(size=(X.shape[1], self.n_hidden))
-            self.biases_ = np.random.normal(size=self.n_hidden)
+            self.input_weights_ = self._rng.normal(size=(X.shape[1], self.n_hidden))
+            self.biases_ = self._rng.normal(size=self.n_hidden)
             
             # Calcular la salida de la capa oculta
             H = self._activate(np.dot(X, self.input_weights_) + self.biases_)
             
             # Calcular pesos de salida usando Ridge Regression para regularización
-            ridge = Ridge(alpha=1e-3, fit_intercept=False)
+            ridge = Ridge(alpha=self.ridge_alpha, fit_intercept=False)
             ridge.fit(H, y)
             self.output_weights_ = ridge.coef_.T
             
@@ -261,6 +271,10 @@ class TimeSeriesELM(BaseEstimator, RegressorMixin):
         try:
             # Validar entrada
             X, _ = self._validate_input(X)
+            if self.n_features_in_ is not None and X.shape[1] != self.n_features_in_:
+                raise ValueError(
+                    f"X must have {self.n_features_in_} features, got {X.shape[1]}"
+                )
             
             # Escalar si es necesario
             if self.scaler is not None:
@@ -269,6 +283,8 @@ class TimeSeriesELM(BaseEstimator, RegressorMixin):
             # Generar predicciones
             H = self._activate(np.dot(X, self.input_weights_) + self.biases_)
             predictions = np.dot(H, self.output_weights_)
+            if predictions.ndim == 2 and predictions.shape[1] == 1:
+                return predictions.ravel()
             
             return predictions
             
@@ -296,11 +312,14 @@ class TimeSeriesELM(BaseEstimator, RegressorMixin):
             path = Path(path)
             state_dict = {
                 'config': self._get_config(),
+                'ridge_alpha': self.ridge_alpha,
+                'n_features_in': self.n_features_in_,
                 'weights': {
                     'input_weights': self.input_weights_.tolist() if self.input_weights_ is not None else None,
                     'output_weights': self.output_weights_.tolist() if self.output_weights_ is not None else None,
                     'biases': self.biases_.tolist() if self.biases_ is not None else None
                 },
+                'scaler_state': self._serialize_scaler(),
                 'metrics': {
                     'training': self.training_metrics_,
                     'validation': self.validation_metrics_
@@ -330,13 +349,16 @@ class TimeSeriesELM(BaseEstimator, RegressorMixin):
                 lookback=state_dict['config']['lookback'],
                 scale_data=state_dict['config']['scale_data'],
                 scaler=state_dict['config']['scaler'],
-                random_state=state_dict['config']['random_state']
+                random_state=state_dict['config']['random_state'],
+                ridge_alpha=state_dict.get('ridge_alpha', 1e-3),
             )
             
             # Restaurar pesos
             self.input_weights_ = np.array(state_dict['weights']['input_weights'])
             self.output_weights_ = np.array(state_dict['weights']['output_weights'])
             self.biases_ = np.array(state_dict['weights']['biases'])
+            self.n_features_in_ = state_dict.get('n_features_in')
+            self._restore_scaler(state_dict.get('scaler_state', {}))
             
             # Restaurar métricas
             self.training_metrics_ = state_dict['metrics']['training']
@@ -352,6 +374,48 @@ class TimeSeriesELM(BaseEstimator, RegressorMixin):
     def _get_config(self) -> Dict[str, Any]:
         """Obtiene la configuración del modelo."""
         return asdict(self.state)
+
+    def _serialize_scaler(self) -> Dict[str, Any]:
+        """Serializa el estado del escalador para que las inferencias sean reproducibles."""
+        if self.scaler is None:
+            return {}
+
+        scaler_state: Dict[str, Any] = {'type': self.state.scaler}
+        if isinstance(self.scaler, StandardScaler) and hasattr(self.scaler, 'mean_'):
+            scaler_state.update({
+                'mean_': self.scaler.mean_.tolist(),
+                'scale_': self.scaler.scale_.tolist(),
+                'var_': self.scaler.var_.tolist(),
+                'n_features_in_': int(self.scaler.n_features_in_),
+            })
+        elif isinstance(self.scaler, MinMaxScaler) and hasattr(self.scaler, 'data_min_'):
+            scaler_state.update({
+                'min_': self.scaler.min_.tolist(),
+                'scale_': self.scaler.scale_.tolist(),
+                'data_min_': self.scaler.data_min_.tolist(),
+                'data_max_': self.scaler.data_max_.tolist(),
+                'data_range_': self.scaler.data_range_.tolist(),
+                'n_features_in_': int(self.scaler.n_features_in_),
+            })
+        return scaler_state
+
+    def _restore_scaler(self, scaler_state: Dict[str, Any]) -> None:
+        """Restaura el estado del escalador tras cargar el modelo."""
+        if self.scaler is None or not scaler_state:
+            return
+
+        if isinstance(self.scaler, StandardScaler) and 'mean_' in scaler_state:
+            self.scaler.mean_ = np.array(scaler_state['mean_'], dtype=float)
+            self.scaler.scale_ = np.array(scaler_state['scale_'], dtype=float)
+            self.scaler.var_ = np.array(scaler_state['var_'], dtype=float)
+            self.scaler.n_features_in_ = int(scaler_state['n_features_in_'])
+        elif isinstance(self.scaler, MinMaxScaler) and 'data_min_' in scaler_state:
+            self.scaler.min_ = np.array(scaler_state['min_'], dtype=float)
+            self.scaler.scale_ = np.array(scaler_state['scale_'], dtype=float)
+            self.scaler.data_min_ = np.array(scaler_state['data_min_'], dtype=float)
+            self.scaler.data_max_ = np.array(scaler_state['data_max_'], dtype=float)
+            self.scaler.data_range_ = np.array(scaler_state['data_range_'], dtype=float)
+            self.scaler.n_features_in_ = int(scaler_state['n_features_in_'])
 
     def get_debug_info(self) -> Dict[str, Any]:
         """Obtiene información completa de depuración sobre el modelo."""
